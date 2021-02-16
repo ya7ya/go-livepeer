@@ -60,14 +60,22 @@ func (m *mockBalance) Clear() {
 }
 
 type stubOrchestrator struct {
-	priv       *ecdsa.PrivateKey
-	block      *big.Int
-	signErr    error
-	sessCapErr error
+	priv         *ecdsa.PrivateKey
+	block        *big.Int
+	signErr      error
+	sessCapErr   error
+	ticketParams *net.TicketParams
+	priceInfo    *net.PriceInfo
+	serviceURI   string
+	res          *core.TranscodeResult
+	offchain     bool
 }
 
 func (r *stubOrchestrator) ServiceURI() *url.URL {
-	url, _ := url.Parse("http://localhost:1234")
+	if r.serviceURI == "" {
+		r.serviceURI = "http://localhost:1234"
+	}
+	url, _ := url.Parse(r.serviceURI)
 	return url
 }
 
@@ -76,6 +84,9 @@ func (r *stubOrchestrator) CurrentBlock() *big.Int {
 }
 
 func (r *stubOrchestrator) Sign(msg []byte) ([]byte, error) {
+	if r.offchain {
+		return nil, nil
+	}
 	if r.signErr != nil {
 		return nil, r.signErr
 	}
@@ -97,14 +108,20 @@ func (r *stubOrchestrator) Sign(msg []byte) ([]byte, error) {
 }
 
 func (r *stubOrchestrator) VerifySig(addr ethcommon.Address, msg string, sig []byte) bool {
+	if r.offchain {
+		return true
+	}
 	return crypto.VerifySig(addr, ethcrypto.Keccak256([]byte(msg)), sig)
 }
 
 func (r *stubOrchestrator) Address() ethcommon.Address {
+	if r.offchain {
+		return ethcommon.Address{}
+	}
 	return ethcrypto.PubkeyToAddress(r.priv.PublicKey)
 }
 func (r *stubOrchestrator) TranscodeSeg(md *core.SegTranscodingMetadata, seg *stream.HLSSegment) (*core.TranscodeResult, error) {
-	return nil, nil
+	return r.res, nil
 }
 func (r *stubOrchestrator) StreamIDs(jobID string) ([]core.StreamID, error) {
 	return []core.StreamID{}, nil
@@ -114,16 +131,16 @@ func (r *stubOrchestrator) ProcessPayment(payment net.Payment, manifestID core.M
 	return nil
 }
 
-func (r *stubOrchestrator) TicketParams(sender ethcommon.Address) (*net.TicketParams, error) {
-	return nil, nil
+func (r *stubOrchestrator) TicketParams(sender ethcommon.Address, priceInfo *net.PriceInfo) (*net.TicketParams, error) {
+	return r.ticketParams, nil
 }
 
 func (r *stubOrchestrator) PriceInfo(sender ethcommon.Address) (*net.PriceInfo, error) {
-	return nil, nil
+	return r.priceInfo, nil
 }
 
 func (r *stubOrchestrator) SufficientBalance(addr ethcommon.Address, manifestID core.ManifestID) bool {
-	return false
+	return true
 }
 
 func (r *stubOrchestrator) DebitFees(addr ethcommon.Address, manifestID core.ManifestID, price *net.PriceInfo, pixels int64) {
@@ -201,6 +218,7 @@ func TestRPCSeg(t *testing.T) {
 	s := &BroadcastSession{
 		Broadcaster: b,
 		ManifestID:  mid,
+		Profiles:    []ffmpeg.VideoProfile{ffmpeg.P720p30fps16x9},
 	}
 
 	baddr := ethcrypto.PubkeyToAddress(b.priv.PublicKey)
@@ -326,24 +344,6 @@ func TestEstimateFee(t *testing.T) {
 	fee, err = estimateFee(&stream.HLSSegment{Duration: 2.2}, profiles, priceInfo)
 	assert.Nil(err)
 	assert.Zero(fee.Cmp(expFee))
-}
-
-func TestRatPriceInfo(t *testing.T) {
-	assert := assert.New(t)
-
-	// Test nil priceInfo
-	priceInfo, err := ratPriceInfo(nil)
-	assert.Nil(err)
-	assert.Nil(priceInfo)
-
-	// Test priceInfo.pixelsPerUnit = 0
-	_, err = ratPriceInfo(&net.PriceInfo{PricePerUnit: 0, PixelsPerUnit: 0})
-	assert.EqualError(err, "invalid priceInfo.pixelsPerUnit")
-
-	// Test valid priceInfo
-	priceInfo, err = ratPriceInfo(&net.PriceInfo{PricePerUnit: 7, PixelsPerUnit: 2})
-	assert.Nil(err)
-	assert.Zero(priceInfo.Cmp(big.NewRat(7, 2)))
 }
 
 func TestNewBalanceUpdate(t *testing.T) {
@@ -483,10 +483,11 @@ func TestGenPayment(t *testing.T) {
 	// Test payment creation with 1 ticket
 	batch := &pm.TicketBatch{
 		TicketParams: &pm.TicketParams{
-			Recipient: pm.RandAddress(),
-			FaceValue: big.NewInt(1234),
-			WinProb:   big.NewInt(5678),
-			Seed:      big.NewInt(7777),
+			Recipient:       pm.RandAddress(),
+			FaceValue:       big.NewInt(1234),
+			WinProb:         big.NewInt(5678),
+			Seed:            big.NewInt(7777),
+			ExpirationBlock: big.NewInt(1000),
 		},
 		TicketExpirationParams: &pm.TicketExpirationParams{},
 		Sender:                 pm.RandAddress(),
@@ -612,7 +613,7 @@ func TestValidatePrice(t *testing.T) {
 	// O.PriceInfo.PixelsPerUnit is 0
 	s.OrchestratorInfo.PriceInfo = &net.PriceInfo{PricePerUnit: 1, PixelsPerUnit: 0}
 	err = validatePrice(s)
-	assert.EqualError(err, "invalid priceInfo.pixelsPerUnit")
+	assert.EqualError(err, "pixels per unit is 0")
 }
 
 func TestGetPayment_GivenInvalidBase64_ReturnsError(t *testing.T) {
@@ -708,7 +709,8 @@ func TestGetOrchestrator_GivenValidSig_ReturnsTranscoderURI(t *testing.T) {
 	uri := "http://someuri.com"
 	orch.On("VerifySig", mock.Anything, mock.Anything, mock.Anything).Return(true)
 	orch.On("ServiceURI").Return(url.Parse(uri))
-	orch.On("TicketParams", mock.Anything).Return(nil, nil)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(nil, nil)
 	orch.On("PriceInfo", mock.Anything).Return(nil, nil)
 	oInfo, err := getOrchestrator(orch, &net.OrchestratorRequest{})
 
@@ -736,8 +738,9 @@ func TestGetOrchestrator_GivenValidSig_ReturnsOrchTicketParams(t *testing.T) {
 	expectedParams := defaultTicketParams()
 	orch.On("VerifySig", mock.Anything, mock.Anything, mock.Anything).Return(true)
 	orch.On("ServiceURI").Return(url.Parse(uri))
-	orch.On("TicketParams", mock.Anything).Return(expectedParams, nil)
-	orch.On("PriceInfo", mock.Anything).Return(nil, nil)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(expectedParams, nil)
+	orch.On("PriceInfo", mock.Anything, mock.Anything).Return(nil, nil)
 	oInfo, err := getOrchestrator(orch, &net.OrchestratorRequest{})
 
 	assert := assert.New(t)
@@ -751,8 +754,10 @@ func TestGetOrchestrator_TicketParamsError(t *testing.T) {
 	uri := "http://someuri.com"
 	orch.On("VerifySig", mock.Anything, mock.Anything, mock.Anything).Return(true)
 	orch.On("ServiceURI").Return(url.Parse(uri))
+	orch.On("Address").Return(ethcommon.Address{})
 	expErr := errors.New("TicketParams error")
-	orch.On("TicketParams", mock.Anything).Return(nil, expErr)
+	orch.On("PriceInfo", mock.Anything).Return(nil, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(nil, expErr)
 
 	_, err := getOrchestrator(orch, &net.OrchestratorRequest{})
 
@@ -770,7 +775,8 @@ func TestGetOrchestrator_GivenValidSig_ReturnsOrchPriceInfo(t *testing.T) {
 	}
 	orch.On("VerifySig", mock.Anything, mock.Anything, mock.Anything).Return(true)
 	orch.On("ServiceURI").Return(url.Parse(uri))
-	orch.On("TicketParams", mock.Anything).Return(nil, nil)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(nil, nil)
 	orch.On("PriceInfo", mock.Anything).Return(expectedPrice, nil)
 	oInfo, err := getOrchestrator(orch, &net.OrchestratorRequest{})
 
@@ -787,7 +793,7 @@ func TestGetOrchestrator_PriceInfoError(t *testing.T) {
 
 	orch.On("VerifySig", mock.Anything, mock.Anything, mock.Anything).Return(true)
 	orch.On("ServiceURI").Return(url.Parse(uri))
-	orch.On("TicketParams", mock.Anything).Return(&net.TicketParams{}, nil)
+	orch.On("Address").Return(ethcommon.Address{})
 	orch.On("PriceInfo", mock.Anything).Return(nil, expErr)
 
 	_, err := getOrchestrator(orch, &net.OrchestratorRequest{})
@@ -833,8 +839,8 @@ func (o *mockOrchestrator) ServiceURI() *url.URL {
 	return nil
 }
 func (o *mockOrchestrator) Address() ethcommon.Address {
-	o.Called()
-	return ethcommon.Address{}
+	args := o.Called()
+	return args.Get(0).(ethcommon.Address)
 }
 func (o *mockOrchestrator) TranscoderSecret() string {
 	o.Called()
@@ -873,8 +879,8 @@ func (o *mockOrchestrator) ProcessPayment(payment net.Payment, manifestID core.M
 	return args.Error(0)
 }
 
-func (o *mockOrchestrator) TicketParams(sender ethcommon.Address) (*net.TicketParams, error) {
-	args := o.Called(sender)
+func (o *mockOrchestrator) TicketParams(sender ethcommon.Address, priceInfo *net.PriceInfo) (*net.TicketParams, error) {
+	args := o.Called(sender, priceInfo)
 	if args.Get(0) != nil {
 		return args.Get(0).(*net.TicketParams), args.Error(1)
 	}

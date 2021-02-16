@@ -80,6 +80,8 @@ func (s *LivepeerServer) cliWebServerHandlers(bindAddr string) *http.ServeMux {
 
 	mux.Handle("/signMessage", mustHaveFormParams(signMessageHandler(s.LivepeerNode.Eth), "message"))
 
+	mux.Handle("/vote", mustHaveFormParams(voteHandler(s.LivepeerNode.Eth), "poll", "choiceID"))
+
 	//Set the broadcast config for creating onchain jobs.
 	mux.HandleFunc("/setBroadcastConfig", func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -1077,15 +1079,11 @@ func (s *LivepeerServer) cliWebServerHandlers(bindAddr string) *http.ServeMux {
 			w.Write([]byte("0"))
 			return
 		}
-		be, err := s.LivepeerNode.Eth.Backend()
+		chainID, err := s.LivepeerNode.Database.ChainID()
 		if err != nil {
-			glog.Errorf("Error getting eth backend: %v", err)
+			glog.Errorf("Error getting eth network ID err=%v", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
-		}
-		chainID, err := be.ChainID(r.Context())
-		if err != nil {
-			glog.Errorf("Error getting eth network ID: %v", err)
 		}
 		w.Write([]byte(chainID.String()))
 	})

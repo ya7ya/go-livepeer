@@ -40,7 +40,7 @@ func TestSetupOrchestrator(t *testing.T) {
 	n, err := core.NewLivepeerNode(stubEthClient, "", dbh)
 	require.Nil(err)
 
-	err = setupOrchestrator(context.Background(), n, false)
+	err = setupOrchestrator(context.Background(), n, orch)
 	assert.Nil(err)
 
 	orchs, err := dbh.SelectOrchs(&common.DBOrchFilter{
@@ -53,6 +53,35 @@ func TestSetupOrchestrator(t *testing.T) {
 
 	// test eth.GetTranscoder error
 	stubEthClient.Err = errors.New("GetTranscoder error")
-	err = setupOrchestrator(context.Background(), n, false)
+	err = setupOrchestrator(context.Background(), n, orch)
 	assert.EqualError(err, "GetTranscoder error")
+}
+
+func TestIsLocalURL(t *testing.T) {
+	assert := assert.New(t)
+
+	// Test url.ParseRequestURI error
+	_, err := isLocalURL("127.0.0.1:8935")
+	assert.NotNil(err)
+
+	// Test loopback URLs
+	isLocal, err := isLocalURL("https://127.0.0.1:8935")
+	assert.Nil(err)
+	assert.True(isLocal)
+	isLocal, err = isLocalURL("https://127.0.0.2:8935")
+	assert.Nil(err)
+	assert.True(isLocal)
+
+	// Test localhost URL
+	isLocal, err = isLocalURL("https://localhost:8935")
+	assert.Nil(err)
+	assert.True(isLocal)
+
+	// Test non-local URL
+	isLocal, err = isLocalURL("https://0.0.0.0:8935")
+	assert.Nil(err)
+	assert.False(isLocal)
+	isLocal, err = isLocalURL("https://7.7.7.7:8935")
+	assert.Nil(err)
+	assert.False(isLocal)
 }

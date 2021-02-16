@@ -1,13 +1,15 @@
 package core
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/livepeer/go-livepeer/common"
@@ -24,6 +26,8 @@ type Transcoder interface {
 type LocalTranscoder struct {
 	workDir string
 }
+
+var WorkDir string
 
 func (lt *LocalTranscoder) Transcode(job string, fname string, profiles []ffmpeg.VideoProfile) (*TranscodeData, error) {
 	// Set up in / out config
@@ -56,119 +60,73 @@ func NewLocalTranscoder(workDir string) Transcoder {
 	return &LocalTranscoder{workDir: workDir}
 }
 
-type nvSegResult struct {
-	*TranscodeData
-	error
-}
-
-type nvSegData struct {
-	session  *ffmpeg.Transcoder
-	fname    string
-	profiles []ffmpeg.VideoProfile
-	res      chan *nvSegResult
-}
-
 type NvidiaTranscoder struct {
-	device  *segStack
+	device  string
 	session *ffmpeg.Transcoder
-}
-
-type segStack struct {
-	segs []*nvSegData
-	mu   *sync.Mutex
-	cv   *sync.Cond
-	gpu  string
-}
-
-func newSegStack(gpu string) *segStack {
-	mu := &sync.Mutex{}
-	return &segStack{
-		segs: []*nvSegData{},
-		mu:   mu,
-		cv:   sync.NewCond(mu),
-		gpu:  gpu,
-	}
-}
-
-func (ss *segStack) push(seg *nvSegData) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.segs = append(ss.segs, seg)
-	ss.cv.Broadcast()
-	if monitor.Enabled {
-		monitor.GPUBacklog(ss.gpu, len(ss.segs))
-	}
-}
-
-func (ss *segStack) pop() *nvSegData {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	for len(ss.segs) <= 0 {
-		ss.cv.Wait()
-	}
-	seg := ss.segs[len(ss.segs)-1]
-	ss.segs = ss.segs[:len(ss.segs)-1]
-	if monitor.Enabled {
-		monitor.GPUBacklog(ss.gpu, len(ss.segs))
-	}
-	return seg
 }
 
 func (nv *NvidiaTranscoder) Transcode(job string, fname string, profiles []ffmpeg.VideoProfile) (*TranscodeData, error) {
 
-	segData := &nvSegData{
-		session:  nv.session,
-		fname:    fname,
-		profiles: profiles,
-		res:      make(chan *nvSegResult, 1),
+	in := &ffmpeg.TranscodeOptionsIn{
+		Fname:  fname,
+		Accel:  ffmpeg.Nvidia,
+		Device: nv.device,
 	}
-	nv.device.push(segData)
-	res := <-segData.res
-	return res.TranscodeData, res.error
+	out := profilesToTranscodeOptions(WorkDir, ffmpeg.Nvidia, profiles)
+	res, err := nv.session.Transcode(in, out)
+	if err != nil {
+		return nil, err
+	}
+	return resToTranscodeData(res, out)
 }
 
-var nvidiaDevices map[string]*segStack
-
-func StartNvidiaTranscoders(devices string, workDir string) {
-	nvidiaDevices = make(map[string]*segStack)
-	d := strings.Split(devices, ",")
-	for _, n := range d {
-		st := newSegStack(n)
-		nvidiaDevices[n] = st
-		go runTranscodeLoop(st, workDir)
+// TestNvidiaTranscoder tries to transcode test segment on all the devices
+func TestNvidiaTranscoder(gpu string) error {
+	devices := strings.Split(gpu, ",")
+	b := bytes.NewReader(testSegment)
+	z, err := gzip.NewReader(b)
+	if err != nil {
+		return err
 	}
+	mp4testSeg, err := ioutil.ReadAll(z)
+	z.Close()
+	if err != nil {
+		return err
+	}
+	fname := filepath.Join(WorkDir, "testseg.tempfile")
+	err = ioutil.WriteFile(fname, mp4testSeg, 0644)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(fname)
+	for _, device := range devices {
+		t1 := NewNvidiaTranscoder(device)
+		// "145x1" is the mininal resolution that not leads to error on Windows, so use "145x145"
+		p := ffmpeg.VideoProfile{Resolution: "145x145", Bitrate: "1k", Format: ffmpeg.FormatMP4}
+		profiles := []ffmpeg.VideoProfile{p, p, p, p}
+		td, err := t1.Transcode("", fname, profiles)
+
+		t1.Stop()
+		if err != nil {
+			return err
+		}
+		if len(td.Segments) == 0 || td.Pixels == 0 {
+			return errors.New("Empty transcoded segment")
+		}
+	}
+
+	return nil
 }
 
 func NewNvidiaTranscoder(gpu string) TranscoderSession {
 	return &NvidiaTranscoder{
-		device:  nvidiaDevices[gpu],
+		device:  gpu,
 		session: ffmpeg.NewTranscoder(),
 	}
 }
 
 func (nv *NvidiaTranscoder) Stop() {
 	nv.session.StopTranscoder()
-}
-
-func runTranscodeLoop(stack *segStack, workDir string) {
-	for {
-		seg := stack.pop()
-		// Set up in / out config
-		in := &ffmpeg.TranscodeOptionsIn{
-			Fname:  seg.fname,
-			Accel:  ffmpeg.Nvidia,
-			Device: stack.gpu,
-		}
-		opts := profilesToTranscodeOptions(workDir, ffmpeg.Nvidia, seg.profiles)
-		// Do the Transcoding
-		res, err := seg.session.Transcode(in, opts)
-		if err != nil {
-			seg.res <- &nvSegResult{nil, err}
-			continue
-		}
-		td, err := resToTranscodeData(res, opts)
-		seg.res <- &nvSegResult{td, err}
-	}
 }
 
 func parseURI(uri string) (string, uint64, error) {
@@ -212,7 +170,7 @@ func profilesToTranscodeOptions(workDir string, accel ffmpeg.Acceleration, profi
 	opts := make([]ffmpeg.TranscodeOptions, len(profiles), len(profiles))
 	for i := range profiles {
 		o := ffmpeg.TranscodeOptions{
-			Oname:        fmt.Sprintf("%s/out_%s.ts", workDir, common.RandName()),
+			Oname:        fmt.Sprintf("%s/out_%s.tempfile", workDir, common.RandName()),
 			Profile:      profiles[i],
 			Accel:        accel,
 			AudioEncoder: ffmpeg.ComponentOptions{Name: "copy"},

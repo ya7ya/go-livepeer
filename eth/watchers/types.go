@@ -8,8 +8,9 @@ import (
 
 type BlockWatcher interface {
 	Subscribe(sink chan<- []*blockwatch.Event) event.Subscription
+	GetLatestBlock() (*blockwatch.MiniHeader, error)
 }
 
-type EventWatcher interface {
-	Subscribe(sink chan<- types.Log) event.Subscription
+type timeWatcher interface {
+	SubscribeRounds(sink chan<- types.Log) event.Subscription
 }

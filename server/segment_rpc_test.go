@@ -85,10 +85,17 @@ func TestServeSegment_MismatchHashError(t *testing.T) {
 	s := &BroadcastSession{
 		Broadcaster: stubBroadcaster2(),
 		ManifestID:  core.RandomManifestID(),
+		Profiles:    []ffmpeg.VideoProfile{ffmpeg.P720p30fps16x9},
 	}
 	creds, err := genSegCreds(s, &stream.HLSSegment{})
 	require.Nil(t, err)
 
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 	headers := map[string]string{
@@ -117,6 +124,7 @@ func TestServeSegment_TranscodeSegError(t *testing.T) {
 	s := &BroadcastSession{
 		Broadcaster: stubBroadcaster2(),
 		ManifestID:  core.RandomManifestID(),
+		Profiles:    []ffmpeg.VideoProfile{ffmpeg.P720p30fps16x9},
 	}
 	seg := &stream.HLSSegment{Data: []byte("foo")}
 	creds, err := genSegCreds(s, seg)
@@ -125,6 +133,12 @@ func TestServeSegment_TranscodeSegError(t *testing.T) {
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
 
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 	orch.On("TranscodeSeg", md, seg).Return(nil, errors.New("TranscodeSeg error"))
@@ -170,6 +184,19 @@ func TestVerifySegCreds_Profiles(t *testing.T) {
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	assert.Nil(err)
 	assert.Equal(profiles, md.Profiles)
+
+	// Check error handling with the default invalid Profiles
+	creds, err = genSegCreds(&BroadcastSession{Broadcaster: stubBroadcaster2()}, &stream.HLSSegment{})
+	assert.Nil(err)
+	buf, err := base64.StdEncoding.DecodeString(creds)
+	assert.Nil(err)
+	segData = &net.SegData{}
+	err = proto.Unmarshal(buf, segData)
+	assert.Nil(err)
+	assert.Equal([]byte("invalid"), segData.Profiles)
+	md, err = verifySegCreds(orch, creds, ethcommon.Address{})
+	assert.Nil(md)
+	assert.Equal(common.ErrProfile, err)
 }
 
 func TestGenSegCreds_FullProfiles(t *testing.T) {
@@ -180,13 +207,16 @@ func TestGenSegCreds_FullProfiles(t *testing.T) {
 			Bitrate:    "432k",
 			Framerate:  uint(560),
 			Resolution: "123x456",
+			Format:     ffmpeg.FormatMPEGTS,
 		},
 		ffmpeg.VideoProfile{
 			Name:       "prof2",
 			Bitrate:    "765k",
 			Framerate:  uint(876),
 			Resolution: "456x987",
+			Format:     ffmpeg.FormatMP4,
 		},
+		ffmpeg.VideoProfile{Resolution: "0x0", Bitrate: "0"},
 	}
 
 	s := &BroadcastSession{
@@ -208,7 +238,44 @@ func TestGenSegCreds_FullProfiles(t *testing.T) {
 
 	expectedProfiles, err := common.FFmpegProfiletoNetProfile(profiles)
 	assert.Nil(err)
+	assert.Equal([]byte("invalid"), segData.Profiles)
+	assert.Empty(segData.FullProfiles)
+	assert.Equal(expectedProfiles, segData.FullProfiles2)
+
+	// Check when we have a MP4 sandwiched in between two mpegts
+	assert.Len(s.Profiles, 3)
+	assert.Equal(ffmpeg.FormatMPEGTS, s.Profiles[0].Format)
+	assert.Equal(ffmpeg.FormatMP4, s.Profiles[1].Format)
+	assert.Equal(ffmpeg.FormatNone, s.Profiles[2].Format)
+	data, err = genSegCreds(s, seg)
+	assert.Nil(err)
+	buf, err = base64.StdEncoding.DecodeString(data)
+	assert.Nil(err)
+	err = proto.Unmarshal(buf, &segData)
+	assert.Nil(err)
+	expectedProfiles, err = common.FFmpegProfiletoNetProfile(profiles)
+	assert.Equal([]byte("invalid"), segData.Profiles)
+	assert.Empty(segData.FullProfiles)
+	assert.Equal(expectedProfiles, segData.FullProfiles2)
+
+	// Check that FullProfiles field is used for none/mpegts (not FullProfiles2)
+	s.Profiles[1].Format = ffmpeg.FormatMPEGTS
+	data, err = genSegCreds(s, seg)
+	assert.Nil(err)
+	buf, err = base64.StdEncoding.DecodeString(data)
+	assert.Nil(err)
+	err = proto.Unmarshal(buf, &segData)
+	assert.Nil(err)
+	expectedProfiles, err = common.FFmpegProfiletoNetProfile(profiles)
+	assert.Equal([]byte("invalid"), segData.Profiles)
 	assert.Equal(expectedProfiles, segData.FullProfiles)
+	assert.Empty(segData.FullProfiles2)
+
+	// Check that profile format errors propagate
+	s.Profiles[1].Format = -1
+	data, err = genSegCreds(s, seg)
+	assert.Empty(data)
+	assert.Equal(common.ErrFormatProto, err)
 }
 
 func TestGenSegCreds_Profiles(t *testing.T) {
@@ -254,6 +321,7 @@ func TestVerifySegCreds_FullProfiles(t *testing.T) {
 			Bitrate:    "765k",
 			Framerate:  uint(876),
 			Resolution: "456x987",
+			Format:     ffmpeg.FormatMP4,
 		},
 	}
 
@@ -274,7 +342,29 @@ func TestVerifySegCreds_FullProfiles(t *testing.T) {
 	assert.Nil(err)
 	profiles[0].Bitrate = "432000"
 	profiles[1].Bitrate = "765000"
+	profiles[0].Format = ffmpeg.FormatMPEGTS
 	assert.Equal(profiles, md.Profiles)
+
+	// Test deserialization failure from invalid full profile format
+	segData.FullProfiles[1].Format = -1
+	data, err = proto.Marshal(segData)
+	assert.Nil(err)
+	creds = base64.StdEncoding.EncodeToString(data)
+	md, err = verifySegCreds(orch, creds, ethcommon.Address{})
+	assert.Nil(md)
+	assert.Equal(errFormat, err)
+
+	// Test deserialization with FullProfiles2
+	// (keep invalid FullProfiles populated to exhibit precedence)
+	segData.FullProfiles2 = []*net.VideoProfile{&net.VideoProfile{Name: "prof3"}}
+	data, err = proto.Marshal(segData)
+	assert.Nil(err)
+	creds = base64.StdEncoding.EncodeToString(data)
+	md, err = verifySegCreds(orch, creds, ethcommon.Address{})
+	expected := []ffmpeg.VideoProfile{{Name: "prof3",
+		Bitrate: "0", Resolution: "0x0",
+		Format: ffmpeg.FormatMPEGTS}}
+	assert.Equal(expected, md.Profiles)
 }
 
 func TestMakeFfmpegVideoProfiles(t *testing.T) {
@@ -303,16 +393,19 @@ func TestMakeFfmpegVideoProfiles(t *testing.T) {
 			Bitrate:    fmt.Sprint(videoProfiles[0].Bitrate),
 			Framerate:  uint(videoProfiles[0].Fps),
 			Resolution: fmt.Sprintf("%dx%d", videoProfiles[0].Width, videoProfiles[0].Height),
+			Format:     ffmpeg.FormatMPEGTS,
 		},
 		{
 			Name:       videoProfiles[1].Name,
 			Bitrate:    fmt.Sprint(videoProfiles[1].Bitrate),
 			Framerate:  uint(videoProfiles[1].Fps),
 			Resolution: fmt.Sprintf("%dx%d", videoProfiles[1].Width, videoProfiles[1].Height),
+			Format:     ffmpeg.FormatMPEGTS,
 		},
 	}
 
-	ffmpegProfiles := makeFfmpegVideoProfiles(videoProfiles)
+	ffmpegProfiles, err := makeFfmpegVideoProfiles(videoProfiles)
+	assert.Nil(err)
 	expectedResolution := fmt.Sprintf("%dx%d", videoProfiles[0].Width, videoProfiles[0].Height)
 	assert.Equal(expectedProfiles, ffmpegProfiles)
 	assert.Equal(ffmpegProfiles[0].Resolution, expectedResolution)
@@ -320,8 +413,115 @@ func TestMakeFfmpegVideoProfiles(t *testing.T) {
 	// empty name should return automatically generated name
 	videoProfiles[0].Name = ""
 	expectedName := "net_" + fmt.Sprintf("%dx%d_%d", videoProfiles[0].Width, videoProfiles[0].Height, videoProfiles[0].Bitrate)
-	ffmpegProfiles = makeFfmpegVideoProfiles(videoProfiles)
+	ffmpegProfiles, err = makeFfmpegVideoProfiles(videoProfiles)
+	assert.Nil(err)
 	assert.Equal(ffmpegProfiles[0].Name, expectedName)
+
+	// Unset format should default to mpegts
+	assert.Equal(videoProfiles[0].Format, videoProfiles[1].Format)
+	assert.Equal(videoProfiles[0].Format, net.VideoProfile_MPEGTS)
+
+	videoProfiles[0].Format = net.VideoProfile_MP4
+	videoProfiles[1].Format = net.VideoProfile_MPEGTS
+	ffmpegProfiles, err = makeFfmpegVideoProfiles(videoProfiles)
+	assert.Nil(err)
+	assert.Equal(ffmpegProfiles[0].Format, ffmpeg.FormatMP4)
+	assert.Equal(ffmpegProfiles[1].Format, ffmpeg.FormatMPEGTS)
+
+	// Invalid format should return error
+	videoProfiles[1].Format = -1
+	ffmpegProfiles, err = makeFfmpegVideoProfiles(videoProfiles)
+	assert.Nil(ffmpegProfiles)
+	assert.Equal(errFormat, err)
+}
+
+func TestServeSegment_SaveDataFormat(t *testing.T) {
+	assert := assert.New(t)
+	os := &stubOSSession{}
+	tData := &core.TranscodeData{Segments: []*core.TranscodedSegmentData{
+		&core.TranscodedSegmentData{Data: []byte("unused1")},
+		&core.TranscodedSegmentData{Data: []byte("unused2")},
+	}}
+	tRes := &core.TranscodeResult{
+		TranscodeData: tData,
+		OS:            os,
+	}
+	orch := &stubOrchestrator{res: tRes, offchain: true}
+	handler := serveSegmentHandler(orch)
+
+	oldStorage := drivers.NodeStorage
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	defer func() { drivers.NodeStorage = oldStorage }()
+
+	sess := &BroadcastSession{
+		Profiles:      []ffmpeg.VideoProfile{ffmpeg.P720p30fps16x9, ffmpeg.P720p60fps16x9},
+		Broadcaster:   stubBroadcaster2(),
+		BroadcasterOS: os,
+	}
+	creds, err := genSegCreds(sess, &stream.HLSSegment{})
+	assert.Nil(err)
+	headers := map[string]string{segmentHeader: creds}
+
+	for _, p := range sess.Profiles {
+		assert.Equal(ffmpeg.FormatNone, p.Format) // sanity check
+	}
+
+	// no format in profiles
+	resp := httpPostResp(handler, bytes.NewReader([]byte("")), headers)
+	defer resp.Body.Close()
+	assert.Equal([]string{"P720p30fps16x9/0.ts", "P720p60fps16x9/0.ts"}, os.saved)
+
+	// mp4 format
+	for i, _ := range sess.Profiles {
+		sess.Profiles[i].Format = ffmpeg.FormatMP4
+	}
+	assert.Equal(ffmpeg.FormatNone, ffmpeg.P720p30fps16x9.Format) // sanity
+	assert.Equal(ffmpeg.FormatNone, ffmpeg.P720p60fps16x9.Format) // sanity
+	creds, err = genSegCreds(sess, &stream.HLSSegment{})
+	os = &stubOSSession{} // reset for simplicity
+	tRes.OS = os
+	headers = map[string]string{segmentHeader: creds}
+	resp = httpPostResp(handler, bytes.NewReader([]byte("")), headers)
+	defer resp.Body.Close()
+	assert.Equal([]string{"P720p30fps16x9/0.mp4", "P720p60fps16x9/0.mp4"}, os.saved)
+
+	// mpegts format
+	for i, _ := range sess.Profiles {
+		sess.Profiles[i].Format = ffmpeg.FormatMPEGTS
+	}
+	creds, err = genSegCreds(sess, &stream.HLSSegment{})
+	os = &stubOSSession{} // reset for simplicity
+	tRes.OS = os
+	headers = map[string]string{segmentHeader: creds}
+	resp = httpPostResp(handler, bytes.NewReader([]byte("")), headers)
+	defer resp.Body.Close()
+	assert.Equal([]string{"P720p30fps16x9/0.ts", "P720p60fps16x9/0.ts"}, os.saved)
+
+	// Check for error in format extension detection prior to saving data
+	// Simulate by removing one of the formats from the ffmpeg table
+	assert.Contains(ffmpeg.FormatExtensions, ffmpeg.FormatMPEGTS, "Could not sanity check mpegts format extension")
+	oldExt := ffmpeg.FormatExtensions[ffmpeg.FormatMPEGTS]
+	delete(ffmpeg.FormatExtensions, ffmpeg.FormatMPEGTS)
+	defer func() {
+		ffmpeg.FormatExtensions[ffmpeg.FormatMPEGTS] = oldExt
+		assert.Contains(ffmpeg.FormatExtensions, ffmpeg.FormatMPEGTS)
+	}()
+	assert.NotContains(ffmpeg.FormatExtensions, ffmpeg.FormatMPEGTS)
+	os = &stubOSSession{}
+	tRes.OS = os
+	resp = httpPostResp(handler, bytes.NewReader([]byte("")), headers)
+	defer resp.Body.Close()
+	assert.Empty(os.saved)
+
+	var tr net.TranscodeResult
+	body, err := ioutil.ReadAll(resp.Body)
+	err = proto.Unmarshal(body, &tr)
+	assert.Nil(err)
+	assert.Equal(http.StatusOK, resp.StatusCode)
+
+	res, ok := tr.Result.(*net.TranscodeResult_Error)
+	assert.True(ok)
+	assert.Equal("unknown VideoProfile format for extension", res.Error)
 }
 
 func TestServeSegment_OSSaveDataError(t *testing.T) {
@@ -346,6 +546,12 @@ func TestServeSegment_OSSaveDataError(t *testing.T) {
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
 
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
@@ -407,6 +613,12 @@ func TestServeSegment_ReturnSingleTranscodedSegmentData(t *testing.T) {
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
 
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
@@ -465,6 +677,12 @@ func TestServeSegment_ReturnMultipleTranscodedSegmentData(t *testing.T) {
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
 
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
@@ -500,7 +718,7 @@ func TestServeSegment_ReturnMultipleTranscodedSegmentData(t *testing.T) {
 	assert.Equal(2, len(res.Data.Segments))
 }
 
-func TestServeSegment_UnacceptableProcessPaymentError(t *testing.T) {
+func TestServeSegment_ProcessPaymentError(t *testing.T) {
 	orch := &mockOrchestrator{}
 	handler := serveSegmentHandler(orch)
 
@@ -522,8 +740,8 @@ func TestServeSegment_UnacceptableProcessPaymentError(t *testing.T) {
 	_, err = verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
 
-	// Return an an unacceptable error to trigger bad request
-	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(pm.NewMockReceiveError(errors.New("some error"), false)).Once()
+	// Return an error to trigger bad request
+	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(errors.New("some error"), false).Once()
 
 	headers := map[string]string{
 		paymentHeader: "",
@@ -548,7 +766,6 @@ func TestServeSegment_UnacceptableProcessPaymentError(t *testing.T) {
 
 	assert.Equal(http.StatusBadRequest, resp.StatusCode)
 	assert.Equal("some error", strings.TrimSpace(string(body)))
-
 }
 
 func TestServeSegment_UpdateOrchestratorInfo(t *testing.T) {
@@ -579,22 +796,24 @@ func TestServeSegment_UpdateOrchestratorInfo(t *testing.T) {
 		WinProb:           big.NewInt(100).Bytes(),
 		RecipientRandHash: []byte("bar"),
 		Seed:              []byte("baz"),
+		ExpirationBlock:   big.NewInt(100).Bytes(),
 	}
 
 	price := &net.PriceInfo{
 		PricePerUnit:  2,
 		PixelsPerUnit: 3,
 	}
-	// Return an acceptable payment error to trigger an update to orchestrator info
-	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(pm.NewMockReceiveError(errors.New("some error"), true)).Once()
-	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
-
-	orch.On("TicketParams", mock.Anything).Return(params, nil).Once()
-	orch.On("PriceInfo", mock.Anything).Return(price, nil)
-
+	// trigger an update to orchestrator info
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
 	uri, err := url.Parse("http://google.com")
 	require.Nil(err)
+	addr := ethcommon.BytesToAddress([]byte("foo"))
 	orch.On("ServiceURI").Return(uri)
+	orch.On("Address").Return(addr)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(params, nil).Once()
+	orch.On("PriceInfo", mock.Anything).Return(price, nil)
+	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil).Once()
+	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
 	tData := &core.TranscodeData{Segments: []*core.TranscodedSegmentData{&core.TranscodedSegmentData{Data: []byte("foo")}}}
 	tRes := &core.TranscodeResult{
@@ -630,32 +849,11 @@ func TestServeSegment_UpdateOrchestratorInfo(t *testing.T) {
 	assert.Equal(params.Seed, tr.Info.TicketParams.Seed)
 	assert.Equal(price.PricePerUnit, tr.Info.PriceInfo.PricePerUnit)
 	assert.Equal(price.PixelsPerUnit, tr.Info.PriceInfo.PixelsPerUnit)
-
-	// Return an acceptable payment error to trigger an update to orchestrator info
-	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(pm.NewMockReceiveError(errors.New("some other error"), true)).Once()
-	orch.On("TicketParams", mock.Anything).Return(params, nil).Once()
-
-	resp = httpPostResp(handler, bytes.NewReader(seg.Data), headers)
-	defer resp.Body.Close()
-
-	body, err = ioutil.ReadAll(resp.Body)
-	require.Nil(err)
-
-	err = proto.Unmarshal(body, &tr)
-	require.Nil(err)
-
-	assert.Equal(http.StatusOK, resp.StatusCode)
-
-	assert.Equal(uri.String(), tr.Info.Transcoder)
-	assert.Equal(params.Recipient, tr.Info.TicketParams.Recipient)
-	assert.Equal(params.FaceValue, tr.Info.TicketParams.FaceValue)
-	assert.Equal(params.WinProb, tr.Info.TicketParams.WinProb)
-	assert.Equal(params.RecipientRandHash, tr.Info.TicketParams.RecipientRandHash)
-	assert.Equal(params.Seed, tr.Info.TicketParams.Seed)
+	assert.Equal(addr.Bytes(), tr.Info.Address)
 
 	// Test orchestratorInfo error
-	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(pm.NewMockReceiveError(errors.New("some error"), true)).Once()
-	orch.On("TicketParams", mock.Anything).Return(nil, errors.New("TicketParams error")).Once()
+	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil).Once()
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(nil, errors.New("TicketParams error")).Once()
 
 	resp = httpPostResp(handler, bytes.NewReader(seg.Data), headers)
 	defer resp.Body.Close()
@@ -678,6 +876,7 @@ func TestServeSegment_InsufficientBalanceError(t *testing.T) {
 	s := &BroadcastSession{
 		Broadcaster: stubBroadcaster2(),
 		ManifestID:  core.RandomManifestID(),
+		Profiles:    []ffmpeg.VideoProfile{ffmpeg.P720p30fps16x9},
 	}
 	seg := &stream.HLSSegment{Data: []byte("foo")}
 	creds, err := genSegCreds(s, seg)
@@ -725,6 +924,12 @@ func TestServeSegment_DebitFees_SingleRendition(t *testing.T) {
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
 
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
@@ -784,7 +989,12 @@ func TestServeSegment_DebitFees_MultipleRenditions(t *testing.T) {
 
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
-
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
@@ -854,7 +1064,12 @@ func TestServeSegment_DebitFees_OSSaveDataError_BreakLoop(t *testing.T) {
 
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
-
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 
@@ -926,7 +1141,12 @@ func TestServeSegment_DebitFees_TranscodeSegError_ZeroPixelsBilled(t *testing.T)
 
 	md, err := verifySegCreds(orch, creds, ethcommon.Address{})
 	require.Nil(err)
-
+	drivers.NodeStorage = drivers.NewMemoryDriver(nil)
+	url, _ := url.Parse("foo")
+	orch.On("ServiceURI").Return(url)
+	orch.On("Address").Return(ethcommon.Address{})
+	orch.On("PriceInfo", mock.Anything).Return(&net.PriceInfo{}, nil)
+	orch.On("TicketParams", mock.Anything, mock.Anything).Return(&net.TicketParams{}, nil)
 	orch.On("ProcessPayment", net.Payment{}, s.ManifestID).Return(nil)
 	orch.On("SufficientBalance", mock.Anything, s.ManifestID).Return(true)
 	orch.On("TranscodeSeg", md, seg).Return(nil, errors.New("TranscodeSeg error"))
@@ -982,7 +1202,7 @@ func TestSubmitSegment_RatPriceInfoError(t *testing.T) {
 
 	_, err := SubmitSegment(s, &stream.HLSSegment{}, 0)
 
-	assert.EqualError(t, err, "invalid priceInfo.pixelsPerUnit")
+	assert.EqualError(t, err, "pixels per unit is 0")
 }
 
 func TestSubmitSegment_EstimateFeeError(t *testing.T) {
@@ -1249,10 +1469,21 @@ func TestSubmitSegment_TranscodeResultError(t *testing.T) {
 }
 
 func TestSubmitSegment_Success(t *testing.T) {
+	info := &net.OrchestratorInfo{
+		Transcoder: "foo",
+		PriceInfo: &net.PriceInfo{
+			PricePerUnit:  1,
+			PixelsPerUnit: 1,
+		},
+		TicketParams: &net.TicketParams{
+			ExpirationBlock: big.NewInt(100).Bytes(),
+		},
+	}
 	require := require.New(t)
 
 	dummyRes := func(tSegData []*net.TranscodedSegmentData) *net.TranscodeResult {
 		return &net.TranscodeResult{
+			Info: info,
 			Result: &net.TranscodeResult_Data{
 				Data: &net.TranscodeData{
 					Segments: tSegData,
@@ -1314,7 +1545,10 @@ func TestSubmitSegment_Success(t *testing.T) {
 	assert.Equal(1, len(tdata.Segments))
 	assert.Equal("foo", tdata.Segments[0].Url)
 	assert.Equal([]byte("bar"), tdata.Sig)
-	assert.Nil(tdata.Info)
+	assert.Equal(tdata.Info.Transcoder, info.Transcoder)
+	assert.Equal(tdata.Info.GetPriceInfo().GetPricePerUnit(), info.GetPriceInfo().GetPricePerUnit())
+	assert.Equal(tdata.Info.GetPriceInfo().GetPixelsPerUnit(), info.GetPriceInfo().GetPixelsPerUnit())
+	assert.Equal(tdata.Info.GetTicketParams().GetExpirationBlock(), info.GetTicketParams().GetExpirationBlock())
 
 	// Check that latency score calculation is different for different segment durations
 	// The round trip duration calculated in SubmitSegment should be about the same across all calls
@@ -1337,14 +1571,18 @@ func TestSubmitSegment_Success(t *testing.T) {
 	assert.Less(latencyScore2, latencyScore1)
 
 	// Check that a new OrchestratorInfo is returned from SubmitSegment()
-	tr.Info = &net.OrchestratorInfo{}
+	tr.Info = info
 	buf, err = proto.Marshal(tr)
 	require.Nil(err)
+	assert.Equal(tr.Info, info)
 
 	tdata, err = SubmitSegment(s, noNameSeg, 0)
 	assert.Nil(err)
 	assert.NotEqual(tdata.Info, s.OrchestratorInfo)
-	assert.Equal(tdata.Info, tr.Info)
+	assert.Equal(tdata.Info.Transcoder, info.Transcoder)
+	assert.Equal(tdata.Info.GetPriceInfo().GetPricePerUnit(), info.GetPriceInfo().GetPricePerUnit())
+	assert.Equal(tdata.Info.GetPriceInfo().GetPixelsPerUnit(), info.GetPriceInfo().GetPixelsPerUnit())
+	assert.Equal(tdata.Info.GetTicketParams().GetExpirationBlock(), info.GetTicketParams().GetExpirationBlock())
 
 	// Test when input data is uploaded
 	runChecks = func(r *http.Request) {

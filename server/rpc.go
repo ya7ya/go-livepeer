@@ -42,7 +42,7 @@ type Orchestrator interface {
 	ServeTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int)
 	TranscoderResults(job int64, res *core.RemoteTranscoderResult)
 	ProcessPayment(payment net.Payment, manifestID core.ManifestID) error
-	TicketParams(sender ethcommon.Address) (*net.TicketParams, error)
+	TicketParams(sender ethcommon.Address, priceInfo *net.PriceInfo) (*net.TicketParams, error)
 	PriceInfo(sender ethcommon.Address) (*net.PriceInfo, error)
 	SufficientBalance(addr ethcommon.Address, manifestID core.ManifestID) bool
 	DebitFees(addr ethcommon.Address, manifestID core.ManifestID, price *net.PriceInfo, pixels int64)
@@ -212,8 +212,8 @@ func GetOrchestratorInfo(ctx context.Context, bcast common.Broadcaster, orchestr
 	req, err := genOrchestratorReq(bcast)
 	r, err := c.GetOrchestrator(ctx, req)
 	if err != nil {
-		glog.Errorf("Could not get orchestrator %v: %v", orchestratorServer, err)
-		return nil, errors.New("Could not get orchestrator: " + err.Error())
+		glog.Errorf("Could not get orchestrator orch=%v err=%v", orchestratorServer, err)
+		return nil, errors.New("Could not get orchestrator err=" + err.Error())
 	}
 
 	return r, nil
@@ -253,12 +253,12 @@ func getOrchestrator(orch Orchestrator, req *net.OrchestratorRequest) (*net.Orch
 }
 
 func orchestratorInfo(orch Orchestrator, addr ethcommon.Address, serviceURI string) (*net.OrchestratorInfo, error) {
-	params, err := orch.TicketParams(addr)
+	priceInfo, err := orch.PriceInfo(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	priceInfo, err := orch.PriceInfo(addr)
+	params, err := orch.TicketParams(addr, priceInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -267,6 +267,7 @@ func orchestratorInfo(orch Orchestrator, addr ethcommon.Address, serviceURI stri
 		Transcoder:   serviceURI,
 		TicketParams: params,
 		PriceInfo:    priceInfo,
+		Address:      orch.Address().Bytes(),
 	}
 
 	os := drivers.NodeStorage.NewSession(string(core.RandomManifestID()))
@@ -297,5 +298,10 @@ func pmTicketParams(params *net.TicketParams) *pm.TicketParams {
 		WinProb:           new(big.Int).SetBytes(params.WinProb),
 		RecipientRandHash: ethcommon.BytesToHash(params.RecipientRandHash),
 		Seed:              new(big.Int).SetBytes(params.Seed),
+		ExpirationBlock:   new(big.Int).SetBytes(params.ExpirationBlock),
+		ExpirationParams: &pm.TicketExpirationParams{
+			CreationRound:          params.ExpirationParams.GetCreationRound(),
+			CreationRoundBlockHash: ethcommon.BytesToHash(params.ExpirationParams.GetCreationRoundBlockHash()),
+		},
 	}
 }

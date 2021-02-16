@@ -41,6 +41,12 @@ type TicketParams struct {
 	RecipientRandHash ethcommon.Hash
 
 	Seed *big.Int
+
+	ExpirationBlock *big.Int
+
+	PricePerPixel *big.Rat
+
+	ExpirationParams *TicketExpirationParams
 }
 
 // WinProbRat returns the ticket WinProb as a percentage represented as a big.Rat
@@ -124,6 +130,12 @@ type Ticket struct {
 
 	// CreationRoundBlockHash is the block hash associated with CreationRound
 	CreationRoundBlockHash ethcommon.Hash
+
+	// ParamsExpirationBlock is the block number at which the ticket parameters used
+	// to create the ticket will no longer be valid
+	ParamsExpirationBlock *big.Int
+
+	PricePerPixel *big.Rat
 }
 
 // NewTicket creates a Ticket instance
@@ -137,6 +149,8 @@ func NewTicket(params *TicketParams, expirationParams *TicketExpirationParams, s
 		RecipientRandHash:      params.RecipientRandHash,
 		CreationRound:          expirationParams.CreationRound,
 		CreationRoundBlockHash: expirationParams.CreationRoundBlockHash,
+		ParamsExpirationBlock:  params.ExpirationBlock,
+		PricePerPixel:          params.PricePerPixel,
 	}
 }
 
@@ -162,15 +176,17 @@ func (t *Ticket) Hash() ethcommon.Hash {
 // [32..63] = CreationRoundBlockHash
 // See: https://github.com/livepeer/protocol/blob/pm/contracts/pm/mixins/MixinTicketProcessor.sol#L94
 func (t *Ticket) AuxData() []byte {
-	if t.CreationRound == 0 && (t.CreationRoundBlockHash == ethcommon.Hash{}) {
-		// Return empty byte array if both values are 0
-		return []byte{}
-	}
+	return (&TicketExpirationParams{
+		CreationRound:          t.CreationRound,
+		CreationRoundBlockHash: t.CreationRoundBlockHash,
+	}).AuxData()
+}
 
-	return append(
-		ethcommon.LeftPadBytes(big.NewInt(t.CreationRound).Bytes(), uint256Size),
-		t.CreationRoundBlockHash.Bytes()...,
-	)
+func (t *Ticket) expirationParams() *TicketExpirationParams {
+	return &TicketExpirationParams{
+		t.CreationRound,
+		t.CreationRoundBlockHash,
+	}
 }
 
 func (t *Ticket) flatten() []byte {
@@ -189,6 +205,18 @@ func (t *Ticket) flatten() []byte {
 	}
 
 	return buf
+}
+
+func (e *TicketExpirationParams) AuxData() []byte {
+	if e.CreationRound == 0 && (e.CreationRoundBlockHash == ethcommon.Hash{}) {
+		// Return empty byte array if both values are 0
+		return []byte{}
+	}
+
+	return append(
+		ethcommon.LeftPadBytes(big.NewInt(e.CreationRound).Bytes(), uint256Size),
+		e.CreationRoundBlockHash.Bytes()...,
+	)
 }
 
 func ticketEV(faceValue *big.Int, winProb *big.Int) *big.Rat {

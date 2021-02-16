@@ -45,7 +45,8 @@ everything from scratch.
 ### Quick start
 - Make sure you have successfully gone through the steps in 'Installing Livepeer' and 'Additional Dependencies'.
 
-- Run `./livepeer -broadcaster -network rinkeby`.
+- Run `./livepeer -broadcaster -network rinkeby -ethUrl <ETHEREUM_RPC_URL>`.
+  * `<ETHEREUM_RPC_URL>` is the JSON-RPC URL of an Ethereum node
 
 - Run `./livepeer_cli`.
   * You should see a wizard launch in the command line.
@@ -78,11 +79,11 @@ If the broadcast is successful, you should be able to access the stream at:
 
 where the "movie" stream name is taken from the path in the RTMP URL.
 
-See the documentation on [RTMP ingest](doc/ingest.md) for more details.
+See the documentation on [RTMP ingest](doc/ingest.md) or [HTTP ingest](doc/ingest.md#http-push) for more details.
 
-#### Authentication of incoming RTMP streams
+#### Authentication of incoming streams
 
-Incoming RTMP streams can be authenicating using RTMP Authentication Webhook functionality, details is [here](doc/rtmpwebhookauth.md).
+Incoming streams can be authenticated using a webhook. More details in the [webhook docs](doc/rtmpwebhookauth.md).
 
 
 ### Streaming
@@ -105,7 +106,7 @@ Livepeer node doesn't do any storage management, it only saves data and never de
 
 We'll walk through the steps of becoming a transcoder on the test network.  To learn more about the transcoder, refer to the [Livepeer whitepaper](https://github.com/livepeer/wiki/blob/master/WHITEPAPER.md) and the [Transcoding guide](http://livepeer.readthedocs.io/en/latest/transcoding.html).
 
-- `livepeer -orchestrator -transcoder -network rinkeby` to start the node as an orchestrator with an attached local transcoder .
+- `livepeer -orchestrator -transcoder -network rinkeby -ethUrl <ETHEREUM_RPC_URL>` to start the node as an orchestrator with an attached local transcoder .
 
 - `livepeer_cli` - make sure you have test ether and test Livepeer token.  Refer to the Quick Start section for getting test ether and test tokens.
 
@@ -121,7 +122,7 @@ We'll walk through the steps of becoming a transcoder on the test network.  To l
 
 Orchestrators can be run in standalone mode without an attached transcoder. Standalone transcoders will need to connect to this orchestrator in order for the orchestrator to process jobs.
 
-- `livepeer -network rinkeby -orchestrator -orchSecret asdf`
+- `livepeer -network rinkeby -ethUrl <ETHEREUM_RPC_URL> -orchestrator -orchSecret asdf`
 
 The orchSecret is a shared secret used to authenticate remote transcoders. It can be any arbitrary string.
 

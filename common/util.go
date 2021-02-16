@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"math/rand"
+	"mime"
 	"regexp"
 	"sort"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/livepeer/go-livepeer/net"
 	ffmpeg "github.com/livepeer/lpms/ffmpeg"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc/peer"
 )
 
@@ -33,6 +35,15 @@ const priceScalingFactor = int64(1000)
 var (
 	ErrParseBigInt = fmt.Errorf("failed to parse big integer")
 	ErrProfile     = fmt.Errorf("failed to parse profile")
+
+	ErrFormatProto = fmt.Errorf("unknown VideoProfile format for protobufs")
+	ErrFormatMime  = fmt.Errorf("unknown VideoProfile format for mime type")
+	ErrFormatExt   = fmt.Errorf("unknown VideoProfile format for extension")
+
+	ext2mime = map[string]string{
+		".ts":  "video/mp2t",
+		".mp4": "video/mp4",
+	}
 )
 
 func init() {
@@ -157,12 +168,22 @@ func FFmpegProfiletoNetProfile(ffmpegProfiles []ffmpeg.VideoProfile) ([]*net.Vid
 		if name == "" {
 			name = "ffmpeg_" + DefaultProfileName(width, height, bitrate)
 		}
+		format := net.VideoProfile_MPEGTS
+		switch profile.Format {
+		case ffmpeg.FormatNone:
+		case ffmpeg.FormatMPEGTS:
+		case ffmpeg.FormatMP4:
+			format = net.VideoProfile_MP4
+		default:
+			return nil, ErrFormatProto
+		}
 		fullProfile := net.VideoProfile{
 			Name:    name,
 			Width:   int32(width),
 			Height:  int32(height),
 			Bitrate: int32(bitrate),
 			Fps:     uint32(profile.Framerate),
+			Format:  format,
 		}
 		profiles = append(profiles, &fullProfile)
 	}
@@ -188,6 +209,37 @@ func ProfilesNames(profiles []ffmpeg.VideoProfile) string {
 	}
 	names.Sort()
 	return strings.Join(names, ",")
+}
+
+func ProfileExtensionFormat(ext string) ffmpeg.Format {
+	p, ok := ffmpeg.ExtensionFormats[ext]
+	if !ok {
+		return ffmpeg.FormatNone
+	}
+	return p
+}
+
+func ProfileFormatExtension(f ffmpeg.Format) (string, error) {
+	ext, ok := ffmpeg.FormatExtensions[f]
+	if !ok {
+		return "", ErrFormatExt
+	}
+	return ext, nil
+}
+
+func ProfileFormatMimeType(f ffmpeg.Format) (string, error) {
+	ext, err := ProfileFormatExtension(f)
+	if err != nil {
+		return "", err
+	}
+	if m, ok := ext2mime[ext]; ok && m != "" {
+		return m, nil
+	}
+	m := mime.TypeByExtension(ext)
+	if m == "" {
+		return "", ErrFormatMime
+	}
+	return m, nil
 }
 
 func GetConnectionAddr(ctx context.Context) string {
@@ -265,4 +317,17 @@ func ToInt64(val *big.Int) int64 {
 	}
 
 	return val.Int64()
+}
+
+func RatPriceInfo(priceInfo *net.PriceInfo) (*big.Rat, error) {
+	if priceInfo == nil {
+		return nil, nil
+	}
+
+	pixelsPerUnit := priceInfo.PixelsPerUnit
+	if pixelsPerUnit == 0 {
+		return nil, errors.New("pixels per unit is 0")
+	}
+
+	return big.NewRat(priceInfo.PricePerUnit, pixelsPerUnit), nil
 }

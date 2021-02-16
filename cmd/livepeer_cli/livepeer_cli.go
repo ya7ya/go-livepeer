@@ -108,6 +108,7 @@ func (w *wizard) initializeOptions() []wizardOpt {
 			w.read()
 		}, testnet: true},
 		{desc: "Sign a message", invoke: w.signMessage},
+		{desc: "Vote in a poll", invoke: w.vote, orchestrator: true},
 	}
 	return options
 }
@@ -173,5 +174,5 @@ var DevenvChainID = "54321"
 func (w *wizard) checkNet() {
 	nID := httpGet(fmt.Sprintf("http://%v:%v/EthChainID", w.host, w.httpPort))
 	w.testnet = nID == RinkebyChainID || nID == DevenvChainID
-	w.offchain = nID == "offchain"
+	w.offchain = nID == "0"
 }

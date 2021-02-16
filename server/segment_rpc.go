@@ -37,6 +37,7 @@ const pixelEstimateMultiplier = 1.02
 
 var errSegEncoding = errors.New("ErrorSegEncoding")
 var errSegSig = errors.New("ErrSegSig")
+var errFormat = errors.New("unrecognized profile output format")
 
 var tlsConfig = &tls.Config{InsecureSkipVerify: true}
 var httpClient = &http.Client{
@@ -66,37 +67,29 @@ func (h *lphttp) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// oInfo will be non-nil if we need to send an updated net.OrchestratorInfo to the broadcaster
-	var oInfo *net.OrchestratorInfo
-
-	if paymentError := orch.ProcessPayment(payment, segData.ManifestID); paymentError != nil {
-
-		acceptableErr, ok := paymentError.(core.AcceptableError)
-		if !ok || !acceptableErr.Acceptable() {
-			glog.Errorf("Unacceptable error occured processing payment: %v", paymentError)
-			http.Error(w, paymentError.Error(), http.StatusBadRequest)
-			return
-		}
-		oInfo, err = orchestratorInfo(orch, sender, orch.ServiceURI().String())
-		if err != nil {
-			glog.Errorf("Error updating orchestrator info: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		glog.Errorf("Acceptable error occured when processing payment: %v", paymentError)
+	if err := orch.ProcessPayment(payment, segData.ManifestID); err != nil {
+		glog.Errorf("error processing payment: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	if !orch.SufficientBalance(sender, segData.ManifestID) {
-		glog.Errorf("Insufficient credit balance for stream with manifestID %v\n", segData.ManifestID)
+		glog.Errorf("Insufficient credit balance for stream - manifestID=%v\n", segData.ManifestID)
 		http.Error(w, "Insufficient balance", http.StatusBadRequest)
+		return
+	}
+
+	oInfo, err := orchestratorInfo(orch, sender, orch.ServiceURI().String())
+	if err != nil {
+		glog.Errorf("Error updating orchestrator info - err=%v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	// download the segment and check the hash
 	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		glog.Error("Could not read request body: ", err)
+		glog.Errorf("Could not read request body - err=%v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -110,7 +103,7 @@ func (h *lphttp) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		took := time.Since(start)
 		glog.V(common.DEBUG).Infof("Getting segment from %s took %s", uri, took)
 		if err != nil {
-			glog.Errorf("Error getting input segment %v from input OS: %v", uri, err)
+			glog.Errorf("Error getting input segment from input OS - segment=%v err=%v", uri, err)
 			http.Error(w, "BadRequest", http.StatusBadRequest)
 			return
 		}
@@ -141,13 +134,20 @@ func (h *lphttp) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		Name:  uri,
 	}
 
-	res, err := orch.TranscodeSeg(segData, &hlsStream) // ANGIE - NEED TO CHANGE ALL JOBIDS IN TRANSCODING LOOP INTO STRINGS
+	res, err := orch.TranscodeSeg(segData, &hlsStream)
 
 	// Upload to OS and construct segment result set
 	var segments []*net.TranscodedSegmentData
 	var pixels int64
 	for i := 0; err == nil && i < len(res.TranscodeData.Segments); i++ {
-		name := fmt.Sprintf("%s/%d.ts", segData.Profiles[i].Name, segData.Seq) // ANGIE - NEED TO EDIT OUT JOB PROFILES
+		var ext string
+		ext, err = common.ProfileFormatExtension(segData.Profiles[i].Format)
+		if err != nil {
+			glog.Errorf("Unknown format extension manifestID=%s seqNo=%d err=%s", segData.ManifestID, segData.Seq, err)
+			break
+		}
+		name := fmt.Sprintf("%s/%d%s", segData.Profiles[i].Name, segData.Seq, ext)
+		// The use of := here is probably a bug?!?
 		uri, err := res.OS.SaveData(name, res.TranscodeData.Segments[i].Data)
 		if err != nil {
 			glog.Error("Could not upload segment ", segData.Seq)
@@ -181,7 +181,7 @@ func (h *lphttp) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	tr := &net.TranscodeResult{
 		Seq:    segData.Seq,
 		Result: result.Result,
-		Info:   oInfo, // oInfo will be non-nil if we need to send an update to the broadcaster
+		Info:   oInfo,
 	}
 	buf, err := proto.Marshal(tr)
 	if err != nil {
@@ -211,22 +211,31 @@ func getPaymentSender(payment net.Payment) ethcommon.Address {
 	return ethcommon.BytesToAddress(payment.Sender)
 }
 
-func makeFfmpegVideoProfiles(protoProfiles []*net.VideoProfile) []ffmpeg.VideoProfile {
+func makeFfmpegVideoProfiles(protoProfiles []*net.VideoProfile) ([]ffmpeg.VideoProfile, error) {
 	profiles := make([]ffmpeg.VideoProfile, 0, len(protoProfiles))
 	for _, profile := range protoProfiles {
 		name := profile.Name
 		if name == "" {
 			name = "net_" + common.DefaultProfileName(int(profile.Width), int(profile.Height), int(profile.Bitrate))
 		}
+		format := ffmpeg.FormatMPEGTS
+		switch profile.Format {
+		case net.VideoProfile_MPEGTS:
+		case net.VideoProfile_MP4:
+			format = ffmpeg.FormatMP4
+		default:
+			return nil, errFormat
+		}
 		prof := ffmpeg.VideoProfile{
 			Name:       name,
 			Bitrate:    fmt.Sprint(profile.Bitrate),
 			Framerate:  uint(profile.Fps),
 			Resolution: fmt.Sprintf("%dx%d", profile.Width, profile.Height),
+			Format:     format,
 		}
 		profiles = append(profiles, prof)
 	}
-	return profiles
+	return profiles, nil
 }
 
 func verifySegCreds(orch Orchestrator, segCreds string, broadcaster ethcommon.Address) (*core.SegTranscodingMetadata, error) {
@@ -243,14 +252,16 @@ func verifySegCreds(orch Orchestrator, segCreds string, broadcaster ethcommon.Ad
 	}
 
 	profiles := []ffmpeg.VideoProfile{}
-	if len(segData.FullProfiles) > 0 {
-		profiles = makeFfmpegVideoProfiles(segData.FullProfiles)
+	if len(segData.FullProfiles2) > 0 {
+		profiles, err = makeFfmpegVideoProfiles(segData.FullProfiles2)
+	} else if len(segData.FullProfiles) > 0 {
+		profiles, err = makeFfmpegVideoProfiles(segData.FullProfiles)
 	} else if len(segData.Profiles) > 0 {
 		profiles, err = common.BytesToVideoProfile(segData.Profiles)
-		if err != nil {
-			glog.Error("Unable to deserialize profiles ", err)
-			return nil, err
-		}
+	}
+	if err != nil {
+		glog.Error("Unable to deserialize profiles ", err)
+		return nil, err
 	}
 
 	mid := core.ManifestID(segData.ManifestId)
@@ -296,7 +307,7 @@ func SubmitSegment(sess *BroadcastSession, seg *stream.HLSSegment, nonce uint64)
 		data = []byte(seg.Name)
 	}
 
-	priceInfo, err := ratPriceInfo(sess.OrchestratorInfo.GetPriceInfo())
+	priceInfo, err := common.RatPriceInfo(sess.OrchestratorInfo.GetPriceInfo())
 	if err != nil {
 		return nil, err
 	}
@@ -344,6 +355,8 @@ func SubmitSegment(sess *BroadcastSession, seg *stream.HLSSegment, nonce uint64)
 	if uploaded {
 		req.Header.Set("Content-Type", "application/vnd+livepeer.uri")
 	} else {
+		// Technically incorrect for MP4 uploads but doesn't really matter
+		// TODO should we set this to some generic "Livepeer video" type?
 		req.Header.Set("Content-Type", "video/MP2T")
 	}
 
@@ -352,7 +365,7 @@ func SubmitSegment(sess *BroadcastSession, seg *stream.HLSSegment, nonce uint64)
 	resp, err := httpClient.Do(req)
 	uploadDur := time.Since(start)
 	if err != nil {
-		glog.Errorf("Unable to submit segment nonce=%d manifestID=%s seqNo=%d orch=%s err=%v", nonce, sess.ManifestID, seg.SeqNo, ti.Transcoder, err)
+		glog.Errorf("Unable to submit segment orch=%v nonce=%d manifestID=%s seqNo=%d orch=%s err=%v", ti.Transcoder, nonce, sess.ManifestID, seg.SeqNo, ti.Transcoder, err)
 		if monitor.Enabled {
 			monitor.SegmentUploadFailed(nonce, seg.SeqNo, monitor.SegmentUploadErrorUnknown, err.Error(), false)
 		}
@@ -496,13 +509,31 @@ func genSegCreds(sess *BroadcastSession, seg *stream.HLSSegment) (string, error)
 
 	// Generate serialized segment info
 	segData := &net.SegData{
-		ManifestId:   []byte(md.ManifestID),
-		Seq:          md.Seq,
-		Hash:         hash,
-		FullProfiles: fullProfiles,
-		Sig:          sig,
-		Storage:      storage,
+		ManifestId: []byte(md.ManifestID),
+		Seq:        md.Seq,
+		Hash:       hash,
+		Sig:        sig,
+		Storage:    storage,
+		// Triggers failure on Os that don't know how to use FullProfiles/2
+		Profiles: []byte("invalid"),
 	}
+	// If all outputs are mpegts, use the older SegData.FullProfiles field
+	// for compatibility with older orchestrators
+	allTS := true
+	for i := 0; i < len(sess.Profiles) && allTS; i++ {
+		switch sess.Profiles[i].Format {
+		case ffmpeg.FormatNone: // default output is mpegts for FormatNone
+		case ffmpeg.FormatMPEGTS:
+		default:
+			allTS = false
+		}
+	}
+	if allTS {
+		segData.FullProfiles = fullProfiles
+	} else {
+		segData.FullProfiles2 = fullProfiles
+	}
+
 	data, err := proto.Marshal(segData)
 	if err != nil {
 		glog.Error("Unable to marshal ", err)
@@ -620,6 +651,7 @@ func genPayment(sess *BroadcastSession, numTickets int) (string, error) {
 			WinProb:           batch.WinProb.Bytes(),
 			RecipientRandHash: batch.RecipientRandHash.Bytes(),
 			Seed:              batch.Seed.Bytes(),
+			ExpirationBlock:   batch.ExpirationBlock.Bytes(),
 		}
 
 		protoPayment.ExpirationParams = &net.TicketExpirationParams{
@@ -637,7 +669,7 @@ func genPayment(sess *BroadcastSession, numTickets int) (string, error) {
 
 		protoPayment.TicketSenderParams = senderParams
 
-		ratPrice, _ := ratPriceInfo(protoPayment.ExpectedPrice)
+		ratPrice, _ := common.RatPriceInfo(protoPayment.ExpectedPrice)
 		glog.V(common.VERBOSE).Infof("Created new payment - manifestID=%v recipient=%v faceValue=%v winProb=%v price=%v numTickets=%v",
 			sess.ManifestID,
 			batch.Recipient.Hex(),
@@ -657,7 +689,7 @@ func genPayment(sess *BroadcastSession, numTickets int) (string, error) {
 }
 
 func validatePrice(sess *BroadcastSession) error {
-	oPrice, err := ratPriceInfo(sess.OrchestratorInfo.GetPriceInfo())
+	oPrice, err := common.RatPriceInfo(sess.OrchestratorInfo.GetPriceInfo())
 	if err != nil {
 		return err
 	}
@@ -670,17 +702,4 @@ func validatePrice(sess *BroadcastSession) error {
 		return fmt.Errorf("Orchestrator price higher than the set maximum price of %v wei per %v pixels", maxPrice.Num().Int64(), maxPrice.Denom().Int64())
 	}
 	return nil
-}
-
-func ratPriceInfo(priceInfo *net.PriceInfo) (*big.Rat, error) {
-	if priceInfo == nil {
-		return nil, nil
-	}
-
-	pixelsPerUnit := priceInfo.PixelsPerUnit
-	if pixelsPerUnit == 0 {
-		return nil, errors.New("invalid priceInfo.pixelsPerUnit")
-	}
-
-	return big.NewRat(priceInfo.PricePerUnit, pixelsPerUnit), nil
 }

@@ -158,6 +158,11 @@ func (m *MockClient) CheckTx(tx *types.Transaction) error {
 	return args.Error(0)
 }
 
+func (m *MockClient) Vote(pollAddr ethcommon.Address, choiceID *big.Int) (*types.Transaction, error) {
+	args := m.Called()
+	return mockTransaction(args, 0), args.Error(1)
+}
+
 type StubClient struct {
 	SubLogsCh                    chan types.Log
 	TranscoderAddress            common.Address
@@ -165,6 +170,7 @@ type StubClient struct {
 	BlockHashToReturn            common.Hash
 	ProcessHistoricalUnbondError error
 	Orchestrators                []*lpTypes.Transcoder
+	Round                        *big.Int
 	RoundsErr                    error
 	SenderInfo                   *pm.SenderInfo
 	PoolSize                     *big.Int
@@ -172,6 +178,7 @@ type StubClient struct {
 	ClaimedReserveError          error
 	Orch                         *lpTypes.Transcoder
 	Err                          error
+	CheckTxErr                   error
 	TotalStake                   *big.Int
 	TranscoderPoolError          error
 }
@@ -182,18 +189,20 @@ type stubTranscoder struct {
 
 func (e *StubClient) Setup(password string, gasLimit uint64, gasPrice *big.Int) error { return nil }
 func (e *StubClient) Account() accounts.Account                                       { return accounts.Account{Address: e.TranscoderAddress} }
-func (e *StubClient) Backend() (Backend, error)                                       { return nil, ErrMissingBackend }
+func (e *StubClient) Backend() (Backend, error)                                       { return nil, nil }
 
 // Rounds
 
-func (e *StubClient) InitializeRound() (*types.Transaction, error)       { return nil, nil }
-func (e *StubClient) CurrentRound() (*big.Int, error)                    { return big.NewInt(0), e.RoundsErr }
-func (e *StubClient) LastInitializedRound() (*big.Int, error)            { return big.NewInt(0), e.RoundsErr }
-func (e *StubClient) BlockHashForRound(round *big.Int) ([32]byte, error) { return [32]byte{}, nil }
-func (e *StubClient) CurrentRoundInitialized() (bool, error)             { return false, nil }
-func (e *StubClient) CurrentRoundLocked() (bool, error)                  { return false, nil }
-func (e *StubClient) CurrentRoundStartBlock() (*big.Int, error)          { return nil, nil }
-func (e *StubClient) Paused() (bool, error)                              { return false, nil }
+func (e *StubClient) InitializeRound() (*types.Transaction, error) { return nil, nil }
+func (e *StubClient) CurrentRound() (*big.Int, error)              { return big.NewInt(0), e.RoundsErr }
+func (e *StubClient) LastInitializedRound() (*big.Int, error)      { return e.Round, e.RoundsErr }
+func (e *StubClient) BlockHashForRound(round *big.Int) ([32]byte, error) {
+	return e.BlockHashToReturn, nil
+}
+func (e *StubClient) CurrentRoundInitialized() (bool, error)    { return false, nil }
+func (e *StubClient) CurrentRoundLocked() (bool, error)         { return false, nil }
+func (e *StubClient) CurrentRoundStartBlock() (*big.Int, error) { return nil, nil }
+func (e *StubClient) Paused() (bool, error)                     { return false, nil }
 
 // Token
 
@@ -321,7 +330,7 @@ func (c *StubClient) TargetBondingRate() (*big.Int, error)        { return big.N
 
 func (c *StubClient) ContractAddresses() map[string]common.Address { return nil }
 func (c *StubClient) CheckTx(tx *types.Transaction) error {
-	return nil
+	return c.CheckTxErr
 }
 func (c *StubClient) ReplaceTransaction(tx *types.Transaction, method string, gasPrice *big.Int) (*types.Transaction, error) {
 	return nil, nil
@@ -332,3 +341,8 @@ func (c *StubClient) SetGasInfo(uint64, *big.Int) error { return nil }
 
 // Faucet
 func (c *StubClient) NextValidRequest(common.Address) (*big.Int, error) { return nil, nil }
+
+// Governance
+func (c *StubClient) Vote(pollAddr ethcommon.Address, choiceID *big.Int) (*types.Transaction, error) {
+	return nil, c.Err
+}

@@ -266,14 +266,20 @@ func (s *stubSubscription) Err() <-chan error {
 }
 
 type stubBlockWatcher struct {
-	sink chan<- []*blockwatch.Event
-	sub  *stubSubscription
+	sink         chan<- []*blockwatch.Event
+	sub          *stubSubscription
+	latestHeader *blockwatch.MiniHeader
+	err          error
 }
 
 func (bw *stubBlockWatcher) Subscribe(sink chan<- []*blockwatch.Event) event.Subscription {
 	bw.sink = sink
 	bw.sub = &stubSubscription{errCh: make(<-chan error)}
 	return bw.sub
+}
+
+func (bw *stubBlockWatcher) GetLatestBlock() (*blockwatch.MiniHeader, error) {
+	return bw.latestHeader, bw.err
 }
 
 type stubUnbondingLock struct {
@@ -349,15 +355,15 @@ func defaultMiniHeader() *blockwatch.MiniHeader {
 	return block
 }
 
-type stubRoundsWatcher struct {
+type stubTimeWatcher struct {
 	sink chan<- types.Log
 	sub  *stubSubscription
 }
 
-func (rw *stubRoundsWatcher) Subscribe(sink chan<- types.Log) event.Subscription {
-	rw.sink = sink
-	rw.sub = &stubSubscription{errCh: make(<-chan error)}
-	return rw.sub
+func (tw *stubTimeWatcher) SubscribeRounds(sink chan<- types.Log) event.Subscription {
+	tw.sink = sink
+	tw.sub = &stubSubscription{errCh: make(<-chan error)}
+	return tw.sub
 }
 
 type stubOrchestratorStore struct {
